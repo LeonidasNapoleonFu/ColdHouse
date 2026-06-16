@@ -1,0 +1,66 @@
+import numpy as np
+import tifffile
+import os
+import glob
+import re
+from pynx.ptycho import save_ptycho_data_cxi
+
+SAVE_DIR = r"D:\pynxdatas"
+BG_DIR = 
+PTY_DIR = 
+POSI_FILE = 
+
+OUTPUT_CXI = os.path.join(SAVE_DIR, "20260406_3eFZP_full1.cxi")
+
+PIXEL_SIZE = 11e-6
+WAVELENGTH = 1.7714e-9
+DETECTOR_DISTANCE = 0.1154948
+
+FRAMES_PER_POS = 3
+def natural_sort_key(s):
+    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
+# 1. 本底
+bg_files = sorted(glob.glob(os.path.join(BG_DIR, "bg1200_1_*.tif")), key=natural_sort_key)
+bg_stack = np.stack([tifffile.imread(f) for f in bg_files], axis=0)
+bg = np.mean(bg_stack, axis=0)
+# 2. 衍射图
+pty_files = sorted(glob.glob(os.path.join(PTY_DIR, "3e1200_1_*.tif")), key=natural_sort_key)
+n_frames = len(pty_files)
+# 3. 扫描位置
+pos_data = np.loadtxt(POSI_FILE)
+n_pos = pos_data.shape[0]
+expected = n_pos * FRAMES_PER_POS
+if n_frames != expected:
+    n_frames = min(n_frames, expected)
+    pty_files = pty_files[:n_frames]
+# 4. 加载、扣本底、按位置取平均
+pty_all = np.stack([tifffile.imread(f).astype(np.float32) for f in pty_files], axis=0)
+iobs_raw = pty_all - bg
+iobs_raw[iobs_raw < 0] = 0
+
+n_frames = iobs_raw.shape[0]
+n_pos = n_frames // FRAMES_PER_POS
+iobs_avg = np.zeros((n_pos, iobs_raw.shape[1], iobs_raw.shape[2]), dtype=np.float32)
+for i in range(n_pos):
+    iobs_avg[i] = np.mean(iobs_raw[i*FRAMES_PER_POS:(i+1)*FRAMES_PER_POS], axis=0)
+
+# 5. 坐标变换
+x_cxi = (pos_data[:n_pos, 2] / 1e6) * -1
+y_cxi = (pos_data[:n_pos, 1] / 1e6) * -1
+
+# 6. 保存
+save_ptycho_data_cxi(
+    file_name=OUTPUT_CXI,
+    iobs=iobs_avg,
+    pixel_size=PIXEL_SIZE,
+    wavelength=WAVELENGTH,
+    detector_distance=DETECTOR_DISTANCE,
+    x=x_cxi,
+    y=y_cxi,
+    overwrite=True
+)
+
+print("-" * 30)
+print(f" 完成！输出文件: {OUTPUT_CXI}")
+print(f"扫描点数: {n_pos}, 每点采集 {FRAMES_PER_POS} 帧")
+print(f"图像尺寸: {iobs_avg.shape[1]} x {iobs_avg.shape[2]}")
