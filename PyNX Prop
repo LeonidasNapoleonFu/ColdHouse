@@ -1,0 +1,51 @@
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from pynx.ptycho.analysis import probe_propagate, probe_fwhm
+
+probe = np.load() #your file path here
+probe_0 = probe[0] #mode of probe
+pixel_size = 9.84e-9
+wavelength = (1240 / 700) * 1e-9
+
+p3d, vdz, izmax, fig_analysis = probe_propagate(
+    probe_0,
+    propagation_range=(-60e-6, -50e-6, 1000),
+    pixel_size=pixel_size,
+    wavelength=wavelength,
+    do_plot=True,
+    show_plot=False
+)
+fig_analysis.savefig("D:/pynxdatas/probe_analysis.png", dpi=150)
+
+focus_field = p3d[izmax]
+focus_intensity = np.abs(focus_field) ** 2
+focus_phase = np.angle(focus_field)
+
+Ny, Nx = focus_field.shape
+x = np.linspace(-Nx/2, Nx/2, Nx) * pixel_size * 1e6
+y = np.linspace(-Ny/2, Ny/2, Ny) * pixel_size * 1e6
+
+fig_focus, axes = plt.subplots(1, 2, figsize=(12, 5))
+im1 = axes[0].imshow(focus_intensity, cmap='inferno', extent=[x[0], x[-1], y[0], y[-1]], origin='lower')
+axes[0].set_title(f'Intensity @ Focus (z={vdz[izmax]*1e6:.1f} µm)')
+axes[0].set_xlabel('X (µm)')
+axes[0].set_ylabel('Y (µm)')
+plt.colorbar(im1, ax=axes[0])
+
+im2 = axes[1].imshow(focus_phase, cmap='twilight', extent=[x[0], x[-1], y[0], y[-1]], origin='lower', vmin=-np.pi, vmax=np.pi)
+axes[1].set_title(f'Phase @ Focus (z={vdz[izmax]*1e6:.1f} µm)')
+axes[1].set_xlabel('X (µm)')
+plt.colorbar(im2, ax=axes[1])
+
+plt.tight_layout()
+fig_focus.savefig("D:/pynxdatas/probe_at_focus.png", dpi=150)
+
+print(f"\nProbe statistics at found focus position (z={vdz[izmax]*1e6:+.1f}um):")
+probe_fwhm(p3d[izmax], pixel_size)
+print("\n图片已保存:")
+print("  分析图: D:/pynxdatas/probe_analysis.png")
+print("  焦点图: D:/pynxdatas/probe_at_focus.png")
+
+plt.show()
