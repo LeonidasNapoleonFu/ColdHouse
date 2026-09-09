@@ -1,0 +1,103 @@
+import os
+import numpy as np
+from pynx.ptycho.runner.cxi import PtychoRunnerScanCXI, default_params
+from pynx.ptycho.cl_operator import DM
+
+CXI_FILE = r" "
+SAVE_DIR = r" "
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+params = default_params.copy()
+params['cxifile'] = CXI_FILE
+params['maxsize'] = 1890
+params['probe'] = 'focus,300e-6,5.075e-3'
+params['defocus'] = 53e-6
+params['detectordistance'] = 0.1154948
+params['detector_orientation'] = [0, 1, 0]
+params['object'] = 'random,0.9,1,0,0.5'
+params['obj_smooth'] = 0
+params['probe_smooth'] = 0.2
+params['obj_inertia'] = 0.05
+params['probe_inertia'] = 0.02
+params['verbose'] = 20
+
+
+params['algorithm'] = 'manual'
+
+print("=" * 70)
+print("Loading and preparing data through official PyNX runner")
+print("=" * 70)
+
+ws = PtychoRunnerScanCXI(params, 0)
+
+
+ws.load_scan()
+ws.load_data()
+ws.prepare_processing_unit()
+ws.center_crop_data()
+ws.prepare()
+ws.run()
+
+p = ws.p
+
+if p is None:
+    raise RuntimeError("PyNX runner did not create Ptycho object")
+
+print("=" * 70)
+print("Runner initialisation finished")
+print("=" * 70)
+
+print("Object shape :", p.get_obj().shape)
+print("Probe shape  :", p.get_probe().shape)
+print("Iobs shape   :", p.data.iobs.shape)
+print(
+    "Object pixel :",
+    p.data.pixel_size_object()[0] * 1e9,
+    "nm"
+)
+
+# ==================== 直接DM ====================
+print("=" * 70)
+print("Starting direct DM operator")
+print("=" * 70)
+
+p = DM(
+    update_object=True,
+    update_probe=True,
+    update_background=False,
+    nb_cycle=1000,
+    calc_llk=20,
+    show_obj_probe=False,
+    obj_smooth_sigma=0,
+    obj_inertia=0.05,
+    probe_smooth_sigma=0.2,
+    probe_inertia=0.02,
+    update_pos=False,
+    zero_phase_ramp=True,
+    alpha=0.02
+) * p
+
+# ==================== 保存 ====================
+obj = p.get_obj()
+probe = p.get_probe()
+
+np.save(
+    os.path.join(SAVE_DIR, "object_dm.npy"),
+    obj
+)
+
+np.save(
+    os.path.join(SAVE_DIR, "probe_dm.npy"),
+    probe
+)
+
+p.save_obj_probe_cxi(
+    os.path.join(SAVE_DIR, "DM_result.cxi")
+)
+
+print("=" * 70)
+print("DM reconstruction finished")
+print("Object :", obj.shape)
+print("Probe  :", probe.shape)
+print("Poisson LLK :", p.get_llk('poisson'))
+print("=" * 70)
