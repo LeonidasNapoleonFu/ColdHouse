@@ -1,0 +1,212 @@
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from numpy.fft import fft2
+from pathlib import Path
+from tkinter import filedialog, Tk, simpledialog
+
+root = Tk()
+root.withdraw()
+
+NPY_FILE = filedialog.askopenfilename(
+    title="选择物体的 .npy 文件",
+    filetypes=[("NumPy files", "*.npy"), ("All files", "*.*")]
+)
+
+if not NPY_FILE:
+    print("未选择文件，退出。")
+    exit()
+
+pixel_input = simpledialog.askstring(
+    "像素尺寸",
+    f"请输入物面像素尺寸 (单位: nm)\n示例: 9.8",
+    initialvalue="9.8"
+)
+
+if pixel_input:
+    PIXEL_SIZE = float(pixel_input)
+else:
+    PIXEL_SIZE = 9.8  # 默认值
+    print(f"未输入，使用默认值: {PIXEL_SIZE} nm")
+
+criterion_choice = simpledialog.askstring(
+    "FRC 阈值标准",
+    "请选择阈值标准:\n  1 = 1/7\n  2 = 1/2-bit\n  3 = 1-bit\n  4 = 两者 (1/7 + 1/2-bit)\n  5 = 全部\n(默认: 全部)",
+    initialvalue="5"
+)
+
+criterion_map = {"1": "1over7", "2": "halfbit", "3": "onebit", "4": "both", "5": "all"}
+CRITERION = criterion_map.get(criterion_choice, "all")
+print(f"选择阈值标准: {CRITERION}")
+
+N_SPLITS = 20
+RMAX = 0.5
+# ====================================================
+
+def radial_bins(shape, rmax=0.5):
+    ny, nx = shape
+    fy = np.fft.fftfreq(ny)[:, None]
+    fx = np.fft.fftfreq(nx)[None, :]
+    r = np.hypot(fx, fy)
+    dr = 1.0 / min(ny, nx)
+    nbins = int(np.floor(rmax / dr)) + 1
+    edges = np.linspace(0.0, rmax, nbins + 1)
+    bin_idx = np.digitize(r, edges) - 1
+    bin_idx[(bin_idx < 0) | (bin_idx >= nbins)] = -1
+    return bin_idx, edges
+
+def ring_bincount(bin_idx, arr, nbins):
+    valid = bin_idx >= 0
+    bins = bin_idx[valid]
+    vals = arr[valid]
+    return np.bincount(bins.ravel(), weights=vals.ravel(), minlength=nbins).astype(np.float64)[:nbins]
+
+def frc_curve(img1, img2, bin_idx, nbins):
+    F1 = fft2(img1)
+    F2 = fft2(img2)
+    cross = np.real(F1 * np.conj(F2))
+    p1 = np.abs(F1) ** 2
+    p2 = np.abs(F2) ** 2
+    num = ring_bincount(bin_idx, cross, nbins)
+    den1 = ring_bincount(bin_idx, p1, nbins)
+    den2 = ring_bincount(bin_idx, p2, nbins)
+    counts = np.bincount((bin_idx[bin_idx >= 0]).ravel(), minlength=nbins)[:nbins]
+    frc = num / (np.sqrt(den1 * den2) + 1e-20)
+    frc[counts == 0] = np.nan
+    return frc, counts
+
+def threshold_crossing_const(f, y, tau):
+    for i in range(len(y) - 1):
+        y0, y1 = y[i], y[i + 1]
+        if np.any(np.isnan([y0, y1])): continue
+        if (y0 >= tau) and (y1 < tau):
+            t = (tau - y0) / (y1 - y0) if (y1 - y0) != 0 else 0.0
+            return float(f[i] + t * (f[i + 1] - f[i]))
+    return float("nan")
+
+def threshold_crossing_curve(f, y, tcurve):
+    for i in range(len(y) - 1):
+        y0, y1 = y[i], y[i + 1]
+        t0, t1 = tcurve[i], tcurve[i + 1]
+        if np.any(np.isnan([y0, y1, t0, t1])): continue
+        if (y0 >= t0) and (y1 < t1):
+            dy0 = y0 - t0
+            dy1 = y1 - t1
+            t = dy0 / (dy0 - dy1) if (dy0 - dy1) != 0 else 0.0
+            return float(f[i] + t * (f[i + 1] - f[i]))
+    return float("nan")
+
+def halfbit_threshold(counts):
+    n = np.maximum(counts.astype(np.float64), 1.0)
+    s = 1.0 / np.sqrt(n)
+    return (0.2071 + 1.9102 * s) / (1.2071 + 0.9102 * s)
+
+def onebit_threshold(counts):
+    n = np.maximum(counts.astype(np.float64), 1.0)
+    s = 1.0 / np.sqrt(n)
+    return (0.5 + 2.4142 * s) / (1.5 + 1.4142 * s)
+
+# 加载数据
+print(f"加载文件: {NPY_FILE}")
+data = np.load(NPY_FILE)
+
+if data.ndim == 3:
+    if data.shape[0] == 1:
+        data = data[0]
+    else:
+        print(f"使用最后一轮迭代 (index {data.shape[0]-1})")
+        data = data[-1]
+
+if np.iscomplexobj(data):
+    img = np.abs(data)
+else:
+    img = data.copy()
+
+img = np.nan_to_num(img)
+img[img < 0] = 0
+p99 = np.percentile(img, 99.0)
+if p99 > 0:
+    img = np.clip(img * (100.0 / p99), 0, None)
+
+print(f"图像尺寸: {img.shape}")
+print(f"像素大小: {PIXEL_SIZE} nm")
+
+bin_idx, edges = radial_bins(img.shape, RMAX)
+nbins = len(edges) - 1
+freq = 0.5 * (edges[:-1] + edges[1:])
+
+rng = np.random.default_rng(0)
+curves = []
+for _ in range(N_SPLITS):
+    a = rng.poisson(0.5 * img).astype(np.float64)
+    b = rng.poisson(0.5 * img).astype(np.float64)
+    frc, counts = frc_curve(a, b, bin_idx, nbins)
+    curves.append(frc)
+
+curves = np.vstack(curves)
+frc_mean = np.nanmean(curves, axis=0)
+frc_std = np.nanstd(curves, axis=0)
+frc_lo = frc_mean - 1.96 * frc_std / np.sqrt(N_SPLITS)
+frc_hi = frc_mean + 1.96 * frc_std / np.sqrt(N_SPLITS)
+
+th_half = halfbit_threshold(counts)
+th_one = onebit_threshold(counts)
+
+fcut_17 = threshold_crossing_const(freq, frc_mean, 1/7)
+fcut_half = threshold_crossing_curve(freq, frc_mean, th_half)
+fcut_one = threshold_crossing_curve(freq, frc_mean, th_one)
+
+print("\n" + "="*50)
+print("分辨率计算结果")
+print("="*50)
+
+if CRITERION in ["1over7", "both", "all"]:
+    res_real = PIXEL_SIZE / fcut_17
+    print(f"\n[1/7 阈值]")
+    print(f"  截止频率: {fcut_17:.5f} cycles/pixel")
+    print(f"  分辨率: {res_real:.2f} nm")
+
+if CRITERION in ["halfbit", "both", "all"]:
+    res_real = PIXEL_SIZE / fcut_half
+    print(f"\n[1/2-bit 阈值]")
+    print(f"  截止频率: {fcut_half:.5f} cycles/pixel")
+    print(f"  分辨率: {res_real:.2f} nm")
+
+if CRITERION in ["onebit", "all"]:
+    res_real = PIXEL_SIZE / fcut_one
+    print(f"\n[1-bit 阈值]")
+    print(f"  截止频率: {fcut_one:.5f} cycles/pixel")
+    print(f"  分辨率: {res_real:.2f} nm")
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.plot(freq, frc_mean, 'k-', lw=2, label='1FRC')
+ax.fill_between(freq, frc_lo, frc_hi, alpha=0.3, label='95% CI')
+
+if CRITERION in ["1over7", "both", "all"]:
+    ax.axhline(1/7, color='b', ls='--', lw=1.5, label='1/7 threshold')
+    if np.isfinite(fcut_17):
+        ax.axvline(fcut_17, color='b', ls=':', lw=1.5, label=f'cutoff: {PIXEL_SIZE/fcut_17:.2f} nm')
+
+if CRITERION in ["halfbit", "both", "all"]:
+    ax.plot(freq, th_half, 'r--', lw=1.5, label='1/2-bit threshold')
+    if np.isfinite(fcut_half):
+        ax.axvline(fcut_half, color='r', ls=':', lw=1.5, label=f'cutoff: {PIXEL_SIZE/fcut_half:.2f} nm')
+
+if CRITERION in ["onebit", "all"]:
+    ax.plot(freq, th_one, 'g--', lw=1.5, label='1-bit threshold')
+    if np.isfinite(fcut_one):
+        ax.axvline(fcut_one, color='g', ls=':', lw=1.5, label=f'cutoff: {PIXEL_SIZE/fcut_one:.2f} nm')
+
+ax.set_xlabel('Spatial frequency (cycles/pixel)')
+ax.set_ylabel('FRC')
+ax.set_xlim(0, RMAX)
+ax.set_ylim(0, 1.05)
+ax.legend(loc='upper right')
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+
+output_path = Path(NPY_FILE).parent / f"{Path(NPY_FILE).stem}_frc.png"
+plt.savefig(output_path, dpi=150, bbox_inches='tight')
+print(f"\n图片已保存: {output_path}")
+plt.show()
