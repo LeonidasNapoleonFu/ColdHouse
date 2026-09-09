@@ -1,0 +1,175 @@
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from pynx.ptycho.analysis import probe_propagate, modes
+
+plt.rcParams.update({
+    'font.family': 'serif',
+    'font.serif': ['Times New Roman'],
+    'font.size': 12,
+    'axes.titlesize': 12,
+    'axes.labelsize': 11,
+    'xtick.labelsize': 10,
+    'ytick.labelsize': 10,
+    'xtick.direction': 'in',
+    'ytick.direction': 'in',
+    'xtick.top': True,
+    'ytick.right': True,
+})
+
+# ==================== Parameters ====================
+pixel_size = 9.8392e-9
+wavelength = 1.771143e-9
+focus_z = -53e-6
+half_range = 30e-6
+n_z = 401
+transverse_range_um = 2.0
+avg_half_width = 2
+probe_path = r"E:\Names\PeiranFu\prdata\figs\prb_power.npy"
+save_xz = rf"E:\Names\PeiranFu\prdata\figs\probe_XZ_focus_{abs(focus_z)*1e6:.0f}um.png"
+save_yz = rf"E:\Names\PeiranFu\prdata\figs\probe_YZ_focus_{abs(focus_z)*1e6:.0f}um.png"
+
+
+# ==================== Load probe ====================
+probe = np.load(probe_path)
+if probe.ndim == 2:
+    probe = probe[np.newaxis, :, :]
+print(f"Probe shape: {probe.shape}")
+print(f"Pixel size: {pixel_size*1e9:.4f} nm")
+print(f"Wavelength: {wavelength*1e9:.6f} nm")
+print(f"Defined focus: {focus_z*1e6:.3f} um")
+print(f"Propagation: {(focus_z-half_range)*1e6:.3f} to {(focus_z+half_range)*1e6:.3f} um")
+print(f"Nz: {n_z}")
+
+# ==================== Mode selection ====================
+print(f"Probe has {probe.shape[0]} modes")
+choice = input("Enter 1 (orthogonalize) or 2 (raw): ").strip()
+if choice == '1':
+    source, power = modes(
+        probe,
+        pixel_size,
+        do_plot=False,
+        show_plot=False,
+        verbose=True
+    )
+    print("Using orthogonalized modes")
+else:
+    source = probe
+    print("Using raw modes")
+mode_idx = int(input(f"Enter mode index (0-{source.shape[0]-1}): ").strip())
+probe_0 = source[mode_idx]
+
+# ==================== Optional padding ====================
+
+target_size = 1890
+ny0, nx0 = probe_0.shape
+if ny0 < target_size or nx0 < target_size:
+    py0 = (target_size - ny0) // 2
+    py1 = target_size - ny0 - py0
+    px0 = (target_size - nx0) // 2
+    px1 = target_size - nx0 - px0
+    probe_0 = np.pad(
+        probe_0,
+        ((py0, py1), (px0, px1)),
+        mode='constant',
+        constant_values=0
+    )
+    print(f"Probe padded from ({ny0}, {nx0}) to {probe_0.shape}")
+else:
+    print(f"No padding applied. Probe size: {probe_0.shape}")
+
+# ==================== Propagation ====================
+z_min = focus_z - half_range
+z_max = focus_z + half_range
+p3d, vdz, _ = probe_propagate(
+    probe_0,
+    propagation_range=(z_min, z_max, n_z),
+    pixel_size=pixel_size,
+    wavelength=wavelength,
+    do_plot=False,
+    show_plot=False
+)
+
+# ==================== Intensity volume ====================
+I3d = np.abs(p3d) ** 2
+nz, ny, nx = I3d.shape
+
+# ==================== Fixed focus plane ====================
+iz_focus = np.argmin(np.abs(vdz - focus_z))
+I_focus = I3d[iz_focus]
+
+
+cx = nx // 2
+cy = ny // 2
+print(f"Focus plane index: {iz_focus}")
+print(f"Fixed geometric center: ({cx}, {cy})")
+
+# ==================== XZ / YZ sections ====================
+y0 = max(cy - avg_half_width, 0)
+y1 = min(cy + avg_half_width + 1, ny)
+x0 = max(cx - avg_half_width, 0)
+x1 = min(cx + avg_half_width + 1, nx)
+
+# XZ: 对y方向中心5像素平均，保留x-z
+xz = np.mean(I3d[:, y0:y1, :], axis=1)
+
+# YZ: 对x方向中心5像素平均，保留y-z
+yz = np.mean(I3d[:, :, x0:x1], axis=2)
+
+# 全局统一归一化，确保XZ/YZ颜色标度一致
+norm = I3d.max()
+if norm > 0:
+    xz = xz / norm
+    yz = yz / norm
+
+# ==================== Coordinates ====================
+x_um = (np.arange(nx) - cx) * pixel_size * 1e6
+y_um = (np.arange(ny) - cy) * pixel_size * 1e6
+z_rel_um = (vdz - focus_z) * 1e6
+
+# ==================== XZ plot ====================
+fig_xz, ax_xz = plt.subplots(figsize=(9, 4.2))
+im_xz = ax_xz.imshow(
+    xz.T,
+    extent=[z_rel_um[0], z_rel_um[-1], x_um[0], x_um[-1]],
+    origin='lower',
+    aspect='auto',
+    cmap='inferno',
+    vmin=0
+)
+ax_xz.axvline(0, linestyle='--', linewidth=1)
+ax_xz.set_xlim(-half_range*1e6, half_range*1e6)
+ax_xz.set_ylim(-transverse_range_um, transverse_range_um)
+ax_xz.set_xlabel('relative to focus (um)')
+ax_xz.set_ylabel('X (um)')
+ax_xz.set_title('XZ propagation')
+cbar_xz = plt.colorbar(im_xz, ax=ax_xz)
+cbar_xz.set_label('Normalized intensity')
+plt.tight_layout()
+fig_xz.savefig(save_xz, dpi=300, bbox_inches='tight')
+
+# ==================== YZ plot ====================
+fig_yz, ax_yz = plt.subplots(figsize=(9, 4.2))
+im_yz = ax_yz.imshow(
+    yz.T,
+    extent=[z_rel_um[0], z_rel_um[-1], y_um[0], y_um[-1]],
+    origin='lower',
+    aspect='auto',
+    cmap='inferno',
+    vmin=0
+)
+ax_yz.axvline(0, linestyle='--', linewidth=1)
+ax_yz.set_xlim(-half_range*1e6, half_range*1e6)
+ax_yz.set_ylim(-transverse_range_um, transverse_range_um)
+ax_yz.set_xlabel('relative to focus (um)')
+ax_yz.set_ylabel('Y (um)')
+ax_yz.set_title('YZ propagation')
+cbar_yz = plt.colorbar(im_yz, ax=ax_yz)
+cbar_yz.set_label('Normalized intensity')
+plt.tight_layout()
+fig_yz.savefig(save_yz, dpi=300, bbox_inches='tight')
+
+print(f"XZ saved: {save_xz}")
+print(f"YZ saved: {save_yz}")
+plt.show()
