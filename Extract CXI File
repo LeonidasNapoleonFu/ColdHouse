@@ -1,0 +1,75 @@
+import h5py
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+import os
+from tkinter import filedialog, Tk
+
+root = Tk()
+root.withdraw()
+
+cxi_file = filedialog.askopenfilename(
+    title="选择 CXI 重建结果文件",
+    filetypes=[("CXI files", "*.cxi"), ("All files", "*.*")]
+)
+
+if not cxi_file:
+    print("未选择文件，退出。")
+    exit()
+
+default_stem = os.path.splitext(os.path.basename(cxi_file))[0]
+save_dir = os.path.dirname(cxi_file) or r"D:\pynxdatas"
+
+obj_name = input(f"物体输出文件名 (默认: {default_stem}_obj.npy): ").strip()
+probe_name = input(f"探针输出文件名 (默认: {default_stem}_probe.npy): ").strip()
+
+if not obj_name:
+    obj_name = f"{default_stem}_obj.npy"
+if not probe_name:
+    probe_name = f"{default_stem}_probe.npy"
+
+obj_path = os.path.join(save_dir, obj_name)
+probe_path = os.path.join(save_dir, probe_name)
+
+print(f"正在读取: {cxi_file}")
+with h5py.File(cxi_file, 'r') as f:
+    obj = f['/entry_1/result_1/Object-layer00'][()]
+    probe = f['/entry_1/result_2/data'][()]
+
+np.save(obj_path, obj)
+np.save(probe_path, probe)
+print(f"物体形状: {obj.shape}, 探针形状: {probe.shape}")
+print(f"已保存: {obj_path}")
+print(f"已保存: {probe_path}")
+
+
+probe_2d = probe[0] if probe.ndim == 3 else probe
+obj_2d = obj[0] if obj.ndim == 3 else obj
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+# 探针振幅
+im1 = axes[0, 0].imshow(np.abs(probe_2d), cmap='hot')
+axes[0, 0].set_title('Probe Amplitude')
+plt.colorbar(im1, ax=axes[0, 0])
+
+# 探针相位
+im2 = axes[0, 1].imshow(np.angle(probe_2d), cmap='hsv')
+axes[0, 1].set_title('Probe Phase')
+plt.colorbar(im2, ax=axes[0, 1])
+
+# 物体振幅
+im3 = axes[1, 0].imshow(np.abs(obj_2d), cmap='gray')
+axes[1, 0].set_title('Object Amplitude')
+plt.colorbar(im3, ax=axes[1, 0])
+
+# 物体相位
+im4 = axes[1, 1].imshow(np.angle(obj_2d), cmap='gray')
+axes[1, 1].set_title('Object Phase')
+plt.colorbar(im4, ax=axes[1, 1])
+
+plt.tight_layout()
+plt.show()
+
+print("完成！")
