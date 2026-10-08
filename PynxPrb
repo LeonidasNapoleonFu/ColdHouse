@@ -1,0 +1,229 @@
+import gc
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+
+ENERGY_EV = 700.0
+WAVELENGTH = (1239.84198 / ENERGY_EV) * 1e-9
+
+FOCAL_LENGTH = 5.075e-3
+DEFOCUS = -53e-6
+PROPAGATION_DISTANCE = FOCAL_LENGTH + DEFOCUS
+
+FZP_DIAMETER = 300e-6
+FZP_RADIUS = FZP_DIAMETER / 2
+CENTRAL_STOP_DIAMETER = 80e-6
+CENTRAL_STOP_RADIUS = CENTRAL_STOP_DIAMETER / 2
+OUTERMOST_ZONE_WIDTH = 31.3e-9
+
+TOPOLOGICAL_CHARGE = 2
+
+DETECTOR_DISTANCE = 0.1154948
+DETECTOR_PIXEL_SIZE = 11e-6
+PROBE_N = 1890
+
+DX_PROBE = WAVELENGTH * DETECTOR_DISTANCE / (PROBE_N * DETECTOR_PIXEL_SIZE)
+DX_FZP = DX_PROBE
+N_FZP = 30720
+FZP_FOV = N_FZP * DX_FZP
+
+if FZP_FOV <= FZP_DIAMETER:
+    raise RuntimeError("FZP numerical FOV is smaller than FZP diameter.")
+
+print("=" * 65)
+print("Explicit FZP probe")
+print("=" * 65)
+print(f"Energy             : {ENERGY_EV:.1f} eV")
+print(f"Wavelength         : {WAVELENGTH*1e9:.6f} nm")
+print(f"Focal length       : {FOCAL_LENGTH*1e3:.6f} mm")
+print(f"Defocus            : {DEFOCUS*1e6:+.3f} um")
+print(f"Propagation z      : {PROPAGATION_DISTANCE*1e3:.6f} mm")
+print(f"Topological charge : {TOPOLOGICAL_CHARGE}")
+print(f"FZP diameter       : {FZP_DIAMETER*1e6:.3f} um")
+print(f"Central stop       : {CENTRAL_STOP_DIAMETER*1e6:.3f} um")
+print(f"FZP array          : {N_FZP} x {N_FZP}")
+print(f"Sampling           : {DX_FZP*1e9:.6f} nm")
+print(f"FZP FOV            : {FZP_FOV*1e6:.3f} um")
+print(f"Outer zone         : {OUTERMOST_ZONE_WIDTH/DX_FZP:.3f} pixel")
+print(f"Final probe        : {PROBE_N} x {PROBE_N}")
+print(f"Final probe FOV    : {PROBE_N*DX_PROBE*1e6:.3f} um")
+print("=" * 65)
+
+t0 = time.time()
+
+coord = (np.arange(N_FZP, dtype=np.float32) - N_FZP // 2) * np.float32(DX_FZP)
+
+print("Generating FZP...")
+x, y = np.meshgrid(coord, coord, indexing="xy")
+r2 = x*x + y*y
+theta = np.arctan2(y, x)
+del x, y
+gc.collect()
+
+zone = np.float32(TOPOLOGICAL_CHARGE) * theta
+zone -= np.float32(np.pi / (WAVELENGTH * FOCAL_LENGTH)) * r2
+del theta
+np.sin(zone, out=zone)
+
+mask = (
+    (r2 > CENTRAL_STOP_RADIUS**2) &
+    (r2 < FZP_RADIUS**2) &
+    (zone >= 0)
+)
+
+fzp = np.zeros((N_FZP, N_FZP), dtype=np.complex64)
+fzp[mask] = 1.0 + 0j
+
+print(f"Transmission       : {np.count_nonzero(fzp)/fzp.size:.6f}")
+del r2, zone, mask
+gc.collect()
+
+print(f"FZP generated      : {time.time()-t0:.2f} s")
+
+t1 = time.time()
+print("Forward FFT...")
+
+spectrum = np.fft.fftshift(
+    np.fft.fft2(
+        np.fft.ifftshift(fzp)
+    )
+).astype(np.complex64, copy=False)
+
+del fzp
+gc.collect()
+
+print(f"Forward FFT        : {time.time()-t1:.2f} s")
+
+t1 = time.time()
+print("Building transfer function...")
+
+fx = np.fft.fftshift(
+    np.fft.fftfreq(N_FZP, d=DX_FZP)
+).astype(np.float32)
+
+lf2 = np.float32(WAVELENGTH) * fx
+lf2 *= lf2
+
+q = np.float32(1.0) - lf2[:, None] - lf2[None, :]
+del lf2, fx
+gc.collect()
+
+propagating = q >= 0
+n_evanescent = q.size - np.count_nonzero(propagating)
+print(f"Evanescent pixels  : {n_evanescent}")
+
+q[~propagating] = 0
+np.sqrt(q, out=q)
+
+q *= np.float32(
+    2*np.pi*PROPAGATION_DISTANCE/WAVELENGTH
+)
+
+H = np.empty((N_FZP, N_FZP), dtype=np.complex64)
+H.real = np.cos(q)
+H.imag = np.sin(q)
+H[~propagating] = 0
+
+del q, propagating
+gc.collect()
+
+print(f"Transfer function  : {time.time()-t1:.2f} s")
+
+t1 = time.time()
+print("Propagation...")
+
+spectrum *= H
+del H
+gc.collect()
+
+probe_full = np.fft.fftshift(
+    np.fft.ifft2(
+        np.fft.ifftshift(spectrum)
+    )
+).astype(np.complex64, copy=False)
+
+del spectrum
+gc.collect()
+
+print(f"Propagation        : {time.time()-t1:.2f} s")
+
+c = N_FZP // 2
+h = PROBE_N // 2
+
+probe = probe_full[
+    c-h:c-h+PROBE_N,
+    c-h:c-h+PROBE_N
+].copy()
+
+del probe_full
+gc.collect()
+
+OUTPUT_FILE = (
+    f"probe_fzp_p{TOPOLOGICAL_CHARGE}"
+    f"_defocus_{DEFOCUS*1e6:+.0f}um.npy"
+)
+
+np.save(OUTPUT_FILE, probe)
+
+intensity = np.abs(probe)**2
+intensity /= intensity.max()
+phase = np.angle(probe)
+
+peak = np.unravel_index(np.argmax(intensity), intensity.shape)
+peak_x = (peak[1] - PROBE_N//2) * DX_PROBE
+peak_y = (peak[0] - PROBE_N//2) * DX_PROBE
+
+print("=" * 65)
+print(f"Probe shape        : {probe.shape}")
+print(f"Probe dtype        : {probe.dtype}")
+print(f"Probe pixel        : {DX_PROBE*1e9:.6f} nm")
+print(f"Peak x             : {peak_x*1e9:.3f} nm")
+print(f"Peak y             : {peak_y*1e9:.3f} nm")
+print(f"Saved              : {OUTPUT_FILE}")
+print(f"Total time         : {time.time()-t0:.2f} s")
+print("=" * 65)
+
+half_um = PROBE_N * DX_PROBE * 0.5e6
+extent_um = [-half_um, half_um, -half_um, half_um]
+
+plt.figure(figsize=(7, 6))
+plt.imshow(np.log10(intensity + 1e-12), extent=extent_um, origin="lower")
+plt.xlabel("x [um]")
+plt.ylabel("y [um]")
+plt.colorbar(label="log10(I/Imax)")
+plt.title(f"FZP intensity: p={TOPOLOGICAL_CHARGE}, defocus={DEFOCUS*1e6:+.0f} um")
+plt.tight_layout()
+
+plt.figure(figsize=(7, 6))
+plt.imshow(phase, extent=extent_um, origin="lower", vmin=-np.pi, vmax=np.pi)
+plt.xlabel("x [um]")
+plt.ylabel("y [um]")
+plt.colorbar(label="Phase [rad]")
+plt.title(f"FZP phase: p={TOPOLOGICAL_CHARGE}, defocus={DEFOCUS*1e6:+.0f} um")
+plt.tight_layout()
+
+center = PROBE_N // 2
+x_nm = (np.arange(PROBE_N) - center) * DX_PROBE * 1e9
+
+plt.figure(figsize=(8, 5))
+plt.plot(x_nm, intensity[center])
+plt.xlabel("x [nm]")
+plt.ylabel("Normalized intensity")
+plt.title("Central intensity profile")
+plt.grid()
+plt.tight_layout()
+
+zoom_half_nm = 500
+zp = int(np.ceil(zoom_half_nm * 1e-9 / DX_PROBE))
+zoom = intensity[center-zp:center+zp+1, center-zp:center+zp+1]
+ze = zp * DX_PROBE * 1e9
+
+plt.figure(figsize=(7, 6))
+plt.imshow(zoom, extent=[-ze, ze, -ze, ze], origin="lower")
+plt.xlabel("x [nm]")
+plt.ylabel("y [nm]")
+plt.colorbar(label="I/Imax")
+plt.title(f"Central focus: p={TOPOLOGICAL_CHARGE}, defocus={DEFOCUS*1e6:+.0f} um")
+plt.tight_layout()
+
+plt.show()
