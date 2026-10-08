@@ -1,0 +1,134 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+file_vortex = r"C:\Users\Public\FuPeiran\Tool4Beamline-main\20251206\SF20251206224857intp_1frc.csv"
+file_gaussian = r"C:\Users\Public\FuPeiran\Tool4Beamline-main\20251206\SF20251206235005intp_1frc.csv"
+
+pixel_size_nm = 10.0
+
+def crossing_halfbit(freq, frc, threshold):
+    for i in range(len(frc) - 1):
+        y0, y1 = frc[i], frc[i + 1]
+        t0, t1 = threshold[i], threshold[i + 1]
+
+        if np.any(np.isnan([y0, y1, t0, t1])):
+            continue
+
+        if y0 >= t0 and y1 < t1:
+            d0 = y0 - t0
+            d1 = y1 - t1
+
+            a = d0 / (d0 - d1) if d0 != d1 else 0.0
+
+            return freq[i] + a * (freq[i + 1] - freq[i])
+
+    return np.nan
+
+v = pd.read_csv(file_vortex)
+g = pd.read_csv(file_gaussian)
+
+fv = v["freq_cyc_per_px"].to_numpy()
+fg = g["freq_cyc_per_px"].to_numpy()
+
+frc_v = v["frc_mean"].to_numpy()
+frc_g = g["frc_mean"].to_numpy()
+
+lo_v = v["frc_lo"].to_numpy()
+hi_v = v["frc_hi"].to_numpy()
+
+lo_g = g["frc_lo"].to_numpy()
+hi_g = g["frc_hi"].to_numpy()
+
+th_v = v["halfbit_threshold"].to_numpy()
+th_g = g["halfbit_threshold"].to_numpy()
+
+fc_v = crossing_halfbit(fv, frc_v, th_v)
+fc_g = crossing_halfbit(fg, frc_g, th_g)
+
+res_v_nm = pixel_size_nm / fc_v
+res_g_nm = pixel_size_nm / fc_g
+
+print(f"Vortex STXM:   fc = {fc_v:.6f} cyc/pixel, resolution = {res_v_nm:.2f} nm")
+print(f"Gaussian STXM: fc = {fc_g:.6f} cyc/pixel, resolution = {res_g_nm:.2f} nm")
+
+# 转为空间频率 μm^-1
+pixel_size_um = pixel_size_nm / 1000.0
+
+fv_um = fv / pixel_size_um
+fg_um = fg / pixel_size_um
+
+fc_v_um = fc_v / pixel_size_um
+fc_g_um = fc_g / pixel_size_um
+
+plt.rcParams.update({
+    "figure.figsize": (8, 6),
+    "axes.linewidth": 1.2,
+    "axes.labelsize": 18,
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+    "legend.fontsize": 14,
+    "font.family": "Arial"
+})
+
+fig, ax = plt.subplots()
+
+ax.plot(
+    fv_um,
+    frc_v,
+    linewidth=2.5,
+    label=f"Vortex STXM ({res_v_nm:.1f} nm)"
+)
+
+ax.plot(
+    fg_um,
+    frc_g,
+    linewidth=2.5,
+    label=f"Gaussian STXM ({res_g_nm:.1f} nm)"
+)
+
+# 两个数据尺寸相同，所以 half-bit threshold 基本完全一致，只画一条
+ax.plot(
+    fv_um,
+    th_v,
+    linestyle="--",
+    linewidth=2.0,
+    label="1/2-bit threshold"
+)
+
+ax.axvline(
+    fc_v_um,
+    linestyle=":",
+    linewidth=1.5
+)
+
+ax.axvline(
+    fc_g_um,
+    linestyle=":",
+    linewidth=1.5
+)
+
+ax.set_xlabel(r"Spatial frequency ($\mu$m$^{-1}$)")
+ax.set_ylabel("FRC")
+
+ax.set_xlim(0, 50)
+ax.set_ylim(0, 1.05)
+
+ax.tick_params(direction="in", top=True, right=True)
+
+ax.legend(frameon=False)
+
+fig.tight_layout()
+
+out = Path(file_vortex).parent / "STXM_FRC_comparison.png"
+
+fig.savefig(
+    out,
+    dpi=600,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+print("Saved:", out)
