@@ -1,0 +1,150 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from pynx.ptycho.simulation import Simulation
+from pynx.ptycho import save_ptycho_data_cxi
+
+ENERGY_EV = 700
+WAVELENGTH = (1239.84198 / ENERGY_EV) * 1e-9
+DETECTOR_DISTANCE = 0.1154948
+DETECTOR_PIXEL_SIZE = 11e-6
+NB_PHOTONS = 1e6
+
+PROBE_FILE = r"D:\pynxdatas\probe_fzp_p2_defocus_-53um.npy"
+POSI_FILE = r"E:\Names\PeiranFu\exp\20260514\ptycho\2026-05-14-20-37-08-posi.txt"
+OUTPUT_CXI = r"D:\pynxdatas\FZP_spiral_test2.cxi"
+
+probe = np.squeeze(np.load(PROBE_FILE)).astype(np.complex64)
+
+if probe.shape != (1890, 1890):
+    raise ValueError(f"Probe shape = {probe.shape}, expected (1890, 1890)")
+
+N = probe.shape[-1]
+pixel_size_object = WAVELENGTH * DETECTOR_DISTANCE / (N * DETECTOR_PIXEL_SIZE)
+
+print("Probe shape:", probe.shape)
+print("Object pixel size:", pixel_size_object * 1e9, "nm")
+
+sim = Simulation(
+    obj_info={'type': 'siemens'},
+    probe=probe,
+    probe_info={},
+    data_info={
+        'wavelength': WAVELENGTH,
+        'detector_distance': DETECTOR_DISTANCE,
+        'detector_pixel_size': DETECTOR_PIXEL_SIZE,
+        'nb_photons_per_frame': None,
+        'noise': False,
+        'bg': 0
+    },
+    verbose=1,
+    prec='single'
+)
+
+pos_data = np.loadtxt(POSI_FILE)
+x_m = -(pos_data[:, 2] * 1e-6)
+y_m = -(pos_data[:, 1] * 1e-6)
+x_pix = x_m / pixel_size_object
+y_pix = y_m / pixel_size_object
+sim.scan.values = (x_pix, y_pix)
+
+print("Number of scan positions:", len(x_pix))
+print("Scan X:", x_m.min()*1e6, "~", x_m.max()*1e6, "um")
+print("Scan Y:", y_m.min()*1e6, "~", y_m.max()*1e6, "um")
+
+sim.make_data()
+
+obj_true = np.squeeze(sim.obj.values)
+probe_true = np.squeeze(sim.probe.values)
+
+print("=" * 70)
+print("GROUND TRUTH CHECK")
+print("Object shape :", obj_true.shape)
+print("Object dtype :", obj_true.dtype)
+print("Object amplitude:")
+print("  min =", np.abs(obj_true).min())
+print("  max =", np.abs(obj_true).max())
+print("  mean=", np.abs(obj_true).mean())
+print("  std =", np.abs(obj_true).std())
+print("Object phase:")
+print("  min =", np.angle(obj_true).min())
+print("  max =", np.angle(obj_true).max())
+print("  std =", np.angle(obj_true).std())
+print("Probe shape :", probe_true.shape)
+print("Probe dtype :", probe_true.dtype)
+print("Probe amplitude:")
+print("  min =", np.abs(probe_true).min())
+print("  max =", np.abs(probe_true).max())
+print("=" * 70)
+
+np.save(r"D:\pynxdatas\object_true.npy", obj_true)
+np.save(r"D:\pynxdatas\probe_true.npy", probe_true)
+
+iobs = np.abs(sim.amplitude.values) ** 2
+raw_photons = iobs.sum(axis=(-2, -1))
+
+print("Iobs shape:", iobs.shape)
+print("Raw photons/frame:")
+print("  min =", raw_photons.min())
+print("  max =", raw_photons.max())
+print("  mean=", raw_photons.mean())
+
+scale = NB_PHOTONS / raw_photons.mean()
+iobs *= scale
+iobs = np.random.poisson(iobs).astype(np.float32)
+
+final_photons = iobs.sum(axis=(-2, -1))
+
+print("Photon scale factor:", scale)
+print("Final photons/frame:")
+print("  min =", final_photons.min())
+print("  max =", final_photons.max())
+print("  mean=", final_photons.mean())
+
+iobs_bl08u = np.flip(iobs, axis=1)
+
+save_ptycho_data_cxi(
+    file_name=OUTPUT_CXI,
+    iobs=iobs_bl08u,
+    pixel_size=DETECTOR_PIXEL_SIZE,
+    wavelength=WAVELENGTH,
+    detector_distance=DETECTOR_DISTANCE,
+    x=x_m,
+    y=y_m,
+    overwrite=True
+)
+
+print("=" * 70)
+print("Simulation finished")
+print("CXI:", OUTPUT_CXI)
+print("Frames:", iobs.shape[0])
+print("Detector shape:", iobs.shape[1:])
+print("Object pixel:", pixel_size_object * 1e9, "nm")
+print("Mean photons/frame:", final_photons.mean())
+print("=" * 70)
+
+plt.figure()
+plt.imshow(np.abs(obj_true), origin='lower')
+plt.colorbar()
+plt.title("Simulation object truth - amplitude")
+
+plt.figure()
+plt.imshow(np.angle(obj_true), origin='lower')
+plt.colorbar()
+plt.title("Simulation object truth - phase")
+
+plt.figure()
+plt.imshow(np.abs(probe_true) ** 2, origin='lower')
+plt.colorbar()
+plt.title("Explicit p=2 FZP probe truth")
+
+plt.figure()
+plt.imshow(np.angle(probe_true), origin='lower', vmin=-np.pi, vmax=np.pi)
+plt.colorbar()
+plt.title("Explicit p=2 FZP probe phase")
+
+plt.figure()
+plt.imshow(np.log10(iobs[0] + 1), origin='lower')
+plt.colorbar()
+plt.title("Diffraction frame 0 - log10(counts + 1)")
+
+plt.show()
