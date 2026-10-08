@@ -1,0 +1,131 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+file_path = r"E:\Names\PeiranFu\exp\DATA\SZP1_MM_01_05\obj.npy"
+
+pixel_size_nm = 9.8
+crop_size_um = 2.0
+bar_nm = 200.0
+
+cx = 1660
+cy = 1770
+
+obj = np.load(file_path)
+
+print("原始 NPY shape =", obj.shape)
+
+obj = np.squeeze(obj)
+
+print("去除单例维度后 shape =", obj.shape)
+
+if np.iscomplexobj(obj):
+    img = np.abs(obj)
+else:
+    img = obj.astype(float)
+
+img_min = img.min()
+img_max = img.max()
+
+img = (img - img_min) / (img_max - img_min + 1e-10)
+img = 1.0 - img
+
+if img.ndim != 2:
+    raise ValueError(f"去除单例维度后仍不是二维图像，shape = {img.shape}")
+
+ny, nx = img.shape
+
+if cx is None:
+    cx = nx // 2
+
+if cy is None:
+    cy = ny // 2
+
+crop_size_nm = crop_size_um * 1000.0
+crop_size_px = int(round(crop_size_nm / pixel_size_nm))
+
+if crop_size_px % 2 != 0:
+    crop_size_px += 1
+
+half = crop_size_px // 2
+
+x1 = cx - half
+x2 = cx + half
+y1 = cy - half
+y2 = cy + half
+
+if x1 < 0 or y1 < 0 or x2 > nx or y2 > ny:
+    raise ValueError(
+        f"裁剪区域超出图像范围。\n"
+        f"原图大小: {nx} × {ny} pixels\n"
+        f"中心: ({cx}, {cy})\n"
+        f"crop: x={x1}:{x2}, y={y1}:{y2}"
+    )
+
+crop = img[y1:y2, x1:x2]
+
+print("原图尺寸:", img.shape)
+print("裁剪中心:", (cx, cy))
+print("裁剪范围:", f"x={x1}:{x2}, y={y1}:{y2}")
+print("裁剪尺寸:", crop.shape)
+print(
+    f"实际物理尺寸: "
+    f"{crop.shape[1] * pixel_size_nm / 1000:.3f} μm × "
+    f"{crop.shape[0] * pixel_size_nm / 1000:.3f} μm"
+)
+
+bar_px = bar_nm / pixel_size_nm
+
+margin_x = 0.08 * crop.shape[1]
+margin_y = 0.08 * crop.shape[0]
+
+x0 = margin_x
+y0 = margin_y
+
+fig, ax = plt.subplots(figsize=(6, 6))
+
+ax.imshow(
+    crop,
+    cmap="gray",
+    origin="lower",
+    interpolation="nearest"
+)
+
+ax.plot(
+    [x0, x0 + bar_px],
+    [y0, y0],
+    color="white",
+    linewidth=5,
+    solid_capstyle="butt"
+)
+
+ax.text(
+    x0 + bar_px / 2,
+    y0 + 0.04 * crop.shape[0],
+    f"{bar_nm:.0f} nm",
+    color="white",
+    fontsize=18,
+    ha="center",
+    va="bottom"
+)
+
+ax.set_xlim(-0.5, crop.shape[1] - 0.5)
+ax.set_ylim(-0.5, crop.shape[0] - 0.5)
+ax.axis("off")
+
+plt.tight_layout(pad=0)
+
+out_path = Path(file_path).with_name(
+    Path(file_path).stem + "_crop_scalebar.png"
+)
+
+plt.savefig(
+    out_path,
+    dpi=600,
+    bbox_inches="tight",
+    pad_inches=0
+)
+
+plt.show()
+
+print("保存至:", out_path)
