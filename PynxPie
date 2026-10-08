@@ -1,0 +1,357 @@
+import os
+import sys
+import numpy as np
+from datetime import datetime
+from pynx.ptycho.runner.cxi import PtychoRunnerScanCXI,default_params
+from pynx.ptycho.cl_operator import DM,ML,AP,ScaleObjProbe
+
+TIMESTAMP=datetime.now().strftime("%y%m%d%H%M%S")
+CXI_FILE=r"D:\pynxdatas\05142eA.cxi"
+SAVE_DIR=rf"D:\pynxdatas\epie_schedule_test_{TIMESTAMP}"
+os.makedirs(SAVE_DIR,exist_ok=True)
+
+class Tee:
+    def __init__(self,*files):
+        self.files=files
+    def write(self,data):
+        for f in self.files:
+            f.write(data)
+            f.flush()
+    def flush(self):
+        for f in self.files:
+            f.flush()
+
+LOG_FILE=os.path.join(SAVE_DIR,"reconstruction_log.txt")
+_log=open(LOG_FILE,"w",encoding="utf-8",buffering=1)
+_stdout=sys.stdout
+_stderr=sys.stderr
+sys.stdout=Tee(_stdout,_log)
+sys.stderr=Tee(_stderr,_log)
+
+print("Timestamp:",TIMESTAMP)
+print("CXI:",CXI_FILE)
+print("Save directory:",SAVE_DIR)
+
+EPIE_CYCLES=10
+EPIE_ALPHA=0.8
+EPIE_BETA=0.2
+POS_MULT=1
+POS_MAX_SHIFT=2
+POS_MIN_SHIFT=0
+POS_THRESHOLD=0.2
+NB=5
+
+
+# algo, cycles, update_object, update_probe, update_pos
+
+ALGORITHM_SCHEDULE=[
+    ("DM",300,True,True,False),
+    ("AP",300,True,True,False),
+    ("ML",500,True,False,False)
+]
+
+params=default_params.copy()
+params['cxifile']=CXI_FILE
+params['maxsize']=1890
+params['probe']='focus,300e-6,5.075e-3'
+params['defocus']=53e-6
+params['detectordistance']=0.1154948
+params['detector_orientation']=[0,1,0]
+params['object']='random,0.9,1,0,0.5'
+params['obj_smooth']=0
+params['probe_smooth']=0.2
+params['obj_inertia']=0.05
+params['probe_inertia']=0.02
+params['verbose']=20
+params['algorithm']='manual'
+
+ws=PtychoRunnerScanCXI(params,0)
+ws.load_scan()
+ws.load_data()
+ws.prepare_processing_unit()
+ws.center_crop_data()
+ws.prepare()
+ws.run()
+p=ws.p
+
+pixel_size=p.data.pixel_size_object()[0]
+posx_initial=np.asarray(p.data.posx).copy()
+posy_initial=np.asarray(p.data.posy).copy()
+np.save(os.path.join(SAVE_DIR,"posx_initial.npy"),posx_initial)
+np.save(os.path.join(SAVE_DIR,"posy_initial.npy"),posy_initial)
+
+print("Object shape:",p.get_obj().shape)
+print("Probe shape:",p.get_probe().shape)
+print("Iobs shape:",p.data.iobs.shape)
+print("Object pixel:",pixel_size*1e9,"nm")
+
+def epie_warm_start(p,nb_cycle=5,alpha=0.8,beta=0.2):
+    obj=np.squeeze(p.get_obj()).astype(np.complex64).copy()
+    probe=np.squeeze(p.get_probe()).astype(np.complex64).copy()
+    iobs=p.get_iobs(shift=True)
+    posx=np.asarray(p.data.posx)
+    posy=np.asarray(p.data.posy)
+    pixel_size=p.data.pixel_size_object()[0]
+    nyo,nxo=obj.shape
+    nyp,nxp=probe.shape
+    cx=nxo//2
+    cy=nyo//2
+    rng=np.random.default_rng(0)
+    for cycle in range(nb_cycle):
+        err=0.0
+        nused=0
+        for j in rng.permutation(len(posx)):
+            dx=int(np.rint(posx[j]/pixel_size))
+            dy=int(np.rint(posy[j]/pixel_size))
+            x0=cx+dx-nxp//2
+            y0=cy+dy-nyp//2
+            patch=obj[y0:y0+nyp,x0:x0+nxp]
+            if patch.shape!=probe.shape:
+                continue
+            exit_wave=patch*probe
+            psi=np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(exit_wave),norm='ortho'))
+            calc_amp=np.abs(psi)
+            obs_j=iobs[j]
+            mask=np.ma.getmaskarray(obs_j)
+            obs=np.ma.filled(obs_j,0.0)
+            valid=~mask
+            psi_new=psi.copy()
+            psi_new[valid]=np.sqrt(np.maximum(obs[valid],0))*psi[valid]/np.maximum(calc_amp[valid],1e-12)
+            exit_new=np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(psi_new),norm='ortho'))
+            delta=exit_new-exit_wave
+            obj_old=patch.copy()
+            probe_old=probe.copy()
+            patch+=alpha*np.conj(probe_old)/(np.max(np.abs(probe_old)**2)+1e-12)*delta
+            probe+=beta*np.conj(obj_old)/(np.max(np.abs(obj_old)**2)+1e-12)*delta
+            obj[y0:y0+nyp,x0:x0+nxp]=patch
+            err+=np.mean((calc_amp[valid]-np.sqrt(np.maximum(obs[valid],0)))**2)
+            nused+=1
+        print(f"ePIE {cycle+1}/{nb_cycle} error={err/max(nused,1):.6e}")
+    return obj,probe
+
+print("="*70)
+print("Starting ePIE")
+print("="*70)
+
+obj_epie,probe_epie=epie_warm_start(p,EPIE_CYCLES,EPIE_ALPHA,EPIE_BETA)
+p.set_obj(obj_epie[np.newaxis])
+p.set_probe(probe_epie[np.newaxis])
+p=ScaleObjProbe(verbose=True)*p
+
+# ===== expand probe to multimode =====
+NB_PROBE=NB
+MODE_SEED=0.03
+
+pr=np.asarray(p.get_probe(),dtype=np.complex64)
+pr0=pr[0].copy()
+ny,nx=pr0.shape
+rng=np.random.default_rng(1234)
+
+pr_multi=np.zeros((NB_PROBE,ny,nx),dtype=np.complex64)
+pr_multi[0]=pr0
+
+amp_rms=np.sqrt(np.mean(np.abs(pr0)**2))
+for m in range(1,NB_PROBE):
+    noise=(rng.standard_normal((ny,nx))+1j*rng.standard_normal((ny,nx)))/np.sqrt(2)
+    pr_multi[m]=MODE_SEED*amp_rms*noise
+
+# preserve total probe power
+power0=np.sum(np.abs(pr0)**2)
+power_multi=np.sum(np.abs(pr_multi)**2)
+pr_multi*=np.sqrt(power0/(power_multi+1e-30))
+
+p.set_probe(pr_multi)
+p=ScaleObjProbe(verbose=True)*p
+
+print("Probe modes:",p.get_nb_probe())
+print("Probe shape:",p.get_probe().shape)
+for m in range(NB_PROBE):
+    pm=np.sum(np.abs(p.get_probe()[m])**2)
+    print(f"Mode {m} power fraction:",pm/np.sum(np.abs(p.get_probe())**2))
+
+obj_epie_scaled=np.squeeze(p.get_obj()).astype(np.complex64).copy()
+probe_epie_scaled=np.squeeze(p.get_probe()).astype(np.complex64).copy()
+np.save(os.path.join(SAVE_DIR,"object_epie.npy"),obj_epie_scaled)
+np.save(os.path.join(SAVE_DIR,"probe_epie.npy"),probe_epie_scaled)
+
+print("="*70)
+print("Starting algorithm schedule")
+print("="*70)
+
+history=[]
+
+for step,(algo,cycles,update_obj,update_probe,update_pos) in enumerate(ALGORITHM_SCHEDULE):
+
+    print("="*70)
+    print(
+        f"Step {step+1}/{len(ALGORITHM_SCHEDULE)} : "
+        f"{algo} cycles={cycles} "
+        f"O={update_obj} P={update_probe} POS={update_pos}"
+    )
+    print("="*70)
+
+
+    if algo=="DM":
+
+        p=DM(
+            update_object=update_obj,
+            update_probe=update_probe,
+            update_background=False,
+            nb_cycle=cycles,
+            calc_llk=20,
+            show_obj_probe=False,
+
+            obj_smooth_sigma=0,
+            obj_inertia=0.05,
+
+            probe_smooth_sigma=0.2,
+            probe_inertia=0.02,
+
+            update_pos=False,
+
+            zero_phase_ramp=True,
+            alpha=0.02
+
+        )*p
+
+
+
+    elif algo=="AP":
+
+        p=AP(
+            update_object=update_obj,
+            update_probe=update_probe,
+            update_background=False,
+
+            nb_cycle=cycles,
+            calc_llk=20,
+
+            show_obj_probe=False,
+
+            obj_smooth_sigma=0,
+            obj_inertia=0.05,
+
+            probe_smooth_sigma=0.2,
+            probe_inertia=0.02,
+
+            update_pos=update_pos,
+
+            zero_phase_ramp=True
+
+        )*p
+
+
+
+    elif algo=="ML":
+
+        p=ML(
+            update_object=update_obj,
+            update_probe=update_probe,
+
+            update_background=False,
+
+            nb_cycle=cycles,
+            calc_llk=20,
+
+            show_obj_probe=False,
+
+            update_pos=False
+
+        )*p
+
+
+
+    else:
+
+        raise ValueError(
+            f"Unknown algorithm: {algo}"
+        )
+
+
+    llk=p.get_llk('poisson')
+
+    print(
+        f"{algo} finished Poisson LLK:",
+        llk
+    )
+
+
+    history.append(
+        [
+            step+1,
+            algo,
+            cycles,
+            update_obj,
+            update_probe,
+            update_pos,
+            llk
+        ]
+    )
+
+
+    np.save(
+        os.path.join(
+            SAVE_DIR,
+            f"object_step{step+1}_{algo}.npy"
+        ),
+        p.get_obj()
+    )
+
+
+    np.save(
+        os.path.join(
+            SAVE_DIR,
+            f"probe_step{step+1}_{algo}.npy"
+        ),
+        p.get_probe()
+    )
+    llk=p.get_llk('poisson')
+    print(f"{algo} finished Poisson LLK:",llk)
+    history.append([step+1,algo,cycles,update_obj,update_probe,update_pos,llk])
+    np.save(os.path.join(SAVE_DIR,f"object_step{step+1}_{algo}.npy"),p.get_obj())
+    np.save(os.path.join(SAVE_DIR,f"probe_step{step+1}_{algo}.npy"),p.get_probe())
+
+obj=p.get_obj()
+probe=p.get_probe()
+posx_final=np.asarray(p.data.posx).copy()
+posy_final=np.asarray(p.data.posy).copy()
+
+np.save(os.path.join(SAVE_DIR,"object_final.npy"),obj)
+np.save(os.path.join(SAVE_DIR,"probe_final.npy"),probe)
+np.save(os.path.join(SAVE_DIR,"posx_final.npy"),posx_final)
+np.save(os.path.join(SAVE_DIR,"posy_final.npy"),posy_final)
+
+dx_nm=(posx_final-posx_initial)*1e9
+dy_nm=(posy_final-posy_initial)*1e9
+dr_nm=np.sqrt(dx_nm**2+dy_nm**2)
+
+np.savetxt(
+    os.path.join(SAVE_DIR,"position_shift_nm.txt"),
+    np.column_stack((dx_nm,dy_nm,dr_nm)),
+    header="dx_nm dy_nm dr_nm"
+)
+
+np.savetxt(
+    os.path.join(SAVE_DIR,"llk_history.txt"),
+    np.asarray(history,dtype=str),
+    fmt="%s",
+    header="step algo cycles update_object update_probe update_pos poisson_llk"
+)
+
+p.save_obj_probe_cxi(os.path.join(SAVE_DIR,"ePIE_schedule_result.cxi"))
+
+print("="*70)
+print("Finished")
+print("Object:",obj.shape)
+print("Probe:",probe.shape)
+print("Poisson LLK:",p.get_llk('poisson'))
+print("Position shift mean:",np.mean(dr_nm),"nm")
+print("Position shift RMS :",np.sqrt(np.mean(dr_nm**2)),"nm")
+print("Position shift max :",np.max(dr_nm),"nm")
+print("Save directory:",SAVE_DIR)
+print("Log file:",LOG_FILE)
+print("="*70)
+
+sys.stdout=_stdout
+sys.stderr=_stderr
+_log.close()
