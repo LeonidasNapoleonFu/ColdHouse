@@ -13,9 +13,9 @@ vortex beam ptychography and reconstruction algorithms.
 
 
 ## 🔬 Research Interests
-- Soft X-ray ptychography
-- Ptychographic reconstruction algorithms
-- Characterization and generation of X-ray vortex beams
+- Soft X-ray Ptychography
+- Ptychographic Reconstruction Algorithms
+- Characterization and Generation of X-ray Vortex Beams
 
 ## 📂 Projects
 Some fuckers and shits about BL08U1A
