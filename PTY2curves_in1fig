@@ -1,0 +1,125 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+file_gaussian = r"D:\FZP01.npy"
+file_vortex = r"D:\SZP01.npy"
+pixel_size_nm = 9.8
+pixel_size_um = pixel_size_nm / 1000.0
+
+f_nyquist_um = 1.0 / (2.0 * pixel_size_um)
+def last_crossing_halfbit(freq, frc, threshold):
+    crossings = []
+    for i in range(len(frc) - 1):
+        y0, y1 = frc[i], frc[i + 1]
+        t0, t1 = threshold[i], threshold[i + 1]
+        if np.any(np.isnan([y0, y1, t0, t1])):
+            continue
+        d0 = y0 - t0
+        d1 = y1 - t1
+        # downward crossing
+        if d0 >= 0 and d1 < 0:
+            a = d0 / (d0 - d1) if d0 != d1 else 0.0
+            fc = freq[i] + a * (freq[i + 1] - freq[i])
+            crossings.append(fc)
+    if len(crossings) == 0:
+        return np.nan
+    return crossings[-1]
+g = np.load(file_gaussian)
+v = np.load(file_vortex)
+# row 0 = f / f_Nyquist
+# row 1 = FRC
+# row 2 = 1/2-bit threshold
+fg_norm = g[0]
+frc_g   = g[1]
+th_g    = g[2]
+fv_norm = v[0]
+frc_v   = v[1]
+th_v    = v[2]
+fc_g_norm = last_crossing_halfbit(
+    fg_norm,
+    frc_g,
+    th_g
+)
+
+fc_v_norm = last_crossing_halfbit(
+    fv_norm,
+    frc_v,
+    th_v
+)
+res_g_nm = pixel_size_nm / fc_g_norm
+res_v_nm = pixel_size_nm / fc_v_norm
+print(
+    f"Gaussian-probe Ptychography: "
+    f"fc = {fc_g_norm:.6f} Nyquist, "
+    f"resolution = {res_g_nm:.2f} nm"
+)
+print(
+    f"Vortex-probe Ptychography: "
+    f"fc = {fc_v_norm:.6f} Nyquist, "
+    f"resolution = {res_v_nm:.2f} nm"
+)
+fg_um = fg_norm * f_nyquist_um
+fv_um = fv_norm * f_nyquist_um
+fc_g_um = fc_g_norm * f_nyquist_um
+fc_v_um = fc_v_norm * f_nyquist_um
+plt.rcParams.update({
+    "figure.figsize": (8, 6),
+    "axes.linewidth": 1.2,
+    "axes.labelsize": 18,
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+    "legend.fontsize": 14,
+    "font.family": "Arial"
+})
+fig, ax = plt.subplots()
+ax.plot(
+    fg_um,
+    frc_g,
+    linewidth=2.5,
+    label=f"Gaussian Ptychography ({res_g_nm:.1f} nm)"
+)
+
+ax.plot(
+    fv_um,
+    frc_v,
+    linewidth=2.5,
+    label=f"Vortex Ptychography ({res_v_nm:.1f} nm)"
+)
+ax.plot(
+    fg_um,
+    th_g,
+    linestyle="--",
+    linewidth=2.0,
+    label="1/2-bit threshold"
+)
+# Resolution positions
+ax.axvline(
+    fc_g_um,
+    linestyle=":",
+    linewidth=1.5
+)
+
+ax.axvline(
+    fc_v_um,
+    linestyle=":",
+    linewidth=1.5
+)
+ax.set_xlabel(r"Spatial frequency ($\mu$m$^{-1}$)")
+ax.set_ylabel("FRC")
+ax.set_xlim(0, f_nyquist_um)
+ax.set_ylim(0, 1.05)
+ax.tick_params(
+    direction="in",
+    top=True,
+    right=True
+)
+ax.legend(frameon=False)
+fig.tight_layout()
+out = Path(file_gaussian).parent / "Ptycho_FRC_comparison.png"
+fig.savefig(
+    out,
+    dpi=600,
+    bbox_inches="tight"
+)
+plt.show()
+print("Saved:", out)
