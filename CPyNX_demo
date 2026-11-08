@@ -1,0 +1,670 @@
+# -*- coding: utf-8 -*-
+"""
+CPyNX v2 - PyNX Ptychography GUI
+
+
+PyNX algorithm 字符串按官方语义从右向左执行。
+"""
+from __future__ import annotations
+
+import os
+import sys
+import shlex
+import queue
+import threading
+import subprocess
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, List
+
+# =============================================================================
+# 0. PyNX 环境
+# =============================================================================
+PYNX_ENV = Path(r"D:\pynx-env")
+PYNX_PYTHON = PYNX_ENV / "python.exe"
+
+
+def ensure_pynx_env() -> None:
+    try:
+        import pynxsimu  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    if PYNX_PYTHON.exists() and Path(sys.executable).resolve() != PYNX_PYTHON.resolve():
+        os.execv(str(PYNX_PYTHON), [str(PYNX_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+    raise RuntimeError(
+        "未检测到 PyNX，\n"
+        "请先确认 PyNX 环境路径。"
+    )
+
+
+ensure_pynx_env()
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+import numpy as np
+import tifffile
+from pynxsimu.ptycho import save_ptycho_data_cxi
+
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PYNX_CMD = Path(sys.executable).resolve().parent / "Scripts" / "pynx-ptycho-cxi.exe"
+APP_TITLE = "CPyNX-篆光 | PyNX Ptychographic Reconstruction Suite"
+
+COLORS = {
+    "bg": "#F5F6F7", "header": "#263746", "card": "#FFFFFF",
+    "border": "#DDE2E5", "text": "#2E3338", "label": "#66727C",
+    "blue": "#3498DB", "blue_h": "#2980B9",
+    "green": "#2ECC71", "green_h": "#27AE60",
+    "orange": "#E67E22", "orange_h": "#D35400",
+    "red": "#E74C3C", "red_h": "#C0392B",
+    "purple": "#9B59B6", "purple_h": "#8E44AD",
+}
+
+
+@dataclass
+class PackConfig:
+    pixel_size_m: float = 11e-6
+    energy_ev: float = 700.0
+    detector_distance_m: float = 0.1154948
+    frames_per_position: int = 3
+
+
+@dataclass
+class AppState:
+    running: bool = False
+    last_cxi: Optional[Path] = None
+    last_save_prefix: Optional[Path] = None
+
+
+class FlatButton(tk.Button):
+    def __init__(self, master, bg, hover, **kwargs):
+        super().__init__(master, **kwargs)
+        self._bg0, self._bgh = bg, hover
+        self.configure(
+            bg=bg, fg="white", bd=0, padx=14, pady=7,
+            font=("微软雅黑", 10, "bold"), cursor="hand2",
+            relief=tk.FLAT, activebackground=hover, activeforeground="white"
+        )
+        self.bind("<Enter>", lambda _: self.configure(bg=self._bgh) if self["state"] != tk.DISABLED else None)
+        self.bind("<Leave>", lambda _: self.configure(bg=self._bg0))
+
+
+class CPyNXApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.state = AppState()
+        self.process: Optional[subprocess.Popen] = None
+        self.log_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+
+        root.title(APP_TITLE)
+        root.geometry("1540x900")
+        root.minsize(1180, 760)
+        root.configure(bg=COLORS["bg"])
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.setup_ui()
+        root.after(80, self.drain_log_queue)
+
+    # ------------------------------------------------------------------ UI --
+    def setup_ui(self):
+        self.setup_header()
+        paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, sashwidth=6, bg=COLORS["bg"])
+        paned.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+
+        left = tk.Frame(paned, bg=COLORS["bg"])
+        right = tk.Frame(paned, bg=COLORS["bg"])
+        paned.add(left, minsize=600)
+        paned.add(right, minsize=520)
+
+        self.setup_left(left)
+        self.setup_right(right)
+
+        self.status = tk.StringVar(value="就绪")
+        tk.Label(
+            self.root, textvariable=self.status, anchor=tk.W,
+            bg="#E7EBEE", fg=COLORS["text"], font=("微软雅黑", 9), padx=8, pady=4
+        ).pack(fill=tk.X, side=tk.BOTTOM)
+
+    def setup_header(self):
+        header = tk.Frame(self.root, bg=COLORS["header"], height=92)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        inner = tk.Frame(header, bg=COLORS["header"])
+        inner.pack(fill=tk.BOTH, expand=True, padx=18, pady=10)
+
+        logo = tk.Frame(inner, bg=COLORS["header"])
+        logo.pack(side=tk.LEFT)
+        self._add_logo(logo, "SINAP.png", (100, 70))
+        self._add_logo(logo, "SSRF.png", (140, 78))
+
+        text = tk.Frame(inner, bg=COLORS["header"])
+        text.pack(side=tk.LEFT, padx=14)
+        tk.Label(text, text="CPyNX-篆光", font=("微软雅黑", 20, "bold"), fg="white", bg=COLORS["header"]).pack(anchor=tk.W)
+        tk.Label(text, text="PyNX-based Ptychographic Reconstruction GUI", font=("微软雅黑", 10), fg="#CCD6DD", bg=COLORS["header"]).pack(anchor=tk.W)
+        tk.Label(text, text="SSRF / BL08U1A · PyNX backend", font=("微软雅黑", 9), fg="#96A6B2", bg=COLORS["header"]).pack(anchor=tk.W)
+
+        tk.Label(
+            inner, text=f"Python: {sys.executable}\nCLI: {PYNX_CMD}", justify=tk.RIGHT,
+            font=("Consolas", 8), fg="#AAB8C2", bg=COLORS["header"]
+        ).pack(side=tk.RIGHT, anchor=tk.E)
+
+    def _add_logo(self, parent, filename, size):
+        if not HAS_PIL:
+            return
+        path = SCRIPT_DIR / filename
+        if not path.exists():
+            return
+        try:
+            im = Image.open(path)
+            resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+            photo = ImageTk.PhotoImage(im.resize(size, resample))
+            label = tk.Label(parent, image=photo, bg=COLORS["header"])
+            label.image = photo
+            label.pack(side=tk.LEFT, padx=(0, 8))
+        except Exception:
+            pass
+
+    def card(self, parent, title):
+        frame = tk.Frame(parent, bg=COLORS["card"], highlightbackground=COLORS["border"], highlightthickness=1)
+        tk.Label(frame, text=title, font=("微软雅黑", 11, "bold"), fg=COLORS["text"], bg=COLORS["card"]).pack(anchor=tk.W, padx=12, pady=(10, 5))
+        return frame
+
+    def setup_left(self, parent):
+        tabs = ttk.Notebook(parent)
+        tabs.pack(fill=tk.BOTH, expand=True)
+        t1 = tk.Frame(tabs, bg=COLORS["bg"])
+        t2 = tk.Frame(tabs, bg=COLORS["bg"])
+        t3 = tk.Frame(tabs, bg=COLORS["bg"])
+        tabs.add(t1, text="1. 数据打包")
+        tabs.add(t2, text="2. 预设重建")
+        tabs.add(t3, text="3. 自定义重建")
+        self.setup_pack_tab(t1)
+        self.setup_recon_tab(t2)
+        self.setup_custom_tab(t3)
+
+    # ------------------------------------------------------------- 打包 CXI --
+    def setup_pack_tab(self, parent):
+        c = self.card(parent, "TIFF + 扫描位置 → CXI")
+        c.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        self.bg_var = tk.StringVar()
+        self.pty_var = tk.StringVar()
+        self.pos_var = tk.StringVar()
+        self.out_var = tk.StringVar(value=str(SCRIPT_DIR / "SSRF_ptycho_data.cxi"))
+
+        rows = [
+            ("本底 TIFF", self.bg_var, self.browse_bg),
+            ("衍射 TIFF", self.pty_var, self.browse_pty),
+            ("位置 TXT", self.pos_var, self.browse_pos),
+            ("输出 CXI", self.out_var, self.browse_out),
+        ]
+        f = tk.Frame(c, bg=COLORS["card"])
+        f.pack(fill=tk.X, padx=12, pady=8)
+        for i, (label, var, cmd) in enumerate(rows):
+            tk.Label(f, text=label + "：", bg=COLORS["card"], fg=COLORS["label"], font=("微软雅黑", 9)).grid(row=i, column=0, sticky=tk.W, pady=5)
+            tk.Entry(f, textvariable=var, font=("Consolas", 9)).grid(row=i, column=1, sticky=tk.EW, padx=8, pady=5)
+            FlatButton(f, "#95A5A6", "#7F8C8D", text="浏览", command=cmd).grid(row=i, column=2, pady=5)
+        f.columnconfigure(1, weight=1)
+
+        pf = tk.LabelFrame(c, text="实验参数", bg=COLORS["card"], font=("微软雅黑", 9, "bold"), padx=8, pady=8)
+        pf.pack(fill=tk.X, padx=12, pady=8)
+        self.pack_entries = {}
+        defs = [
+            ("探测器像素 / m", "pixel", "11e-6"),
+            ("能量 / eV", "energy", "700"),
+            ("探测器距离 / m", "distance", "0.1154948"),
+            ("每位置帧数", "nframe", "3"),
+        ]
+        for i, (label, key, default) in enumerate(defs):
+            tk.Label(pf, text=label, bg=COLORS["card"], font=("微软雅黑", 9)).grid(row=i, column=0, sticky=tk.W, padx=4, pady=4)
+            e = tk.Entry(pf, font=("Consolas", 9), width=18)
+            e.insert(0, default)
+            e.grid(row=i, column=1, sticky=tk.W, padx=8, pady=4)
+            self.pack_entries[key] = e
+
+        self.x_col = tk.StringVar(value="2")
+        self.y_col = tk.StringVar(value="1")
+        self.skiprows = tk.StringVar(value="1")
+        tk.Label(pf, text="位置列 X / Y (0-based)", bg=COLORS["card"], font=("微软雅黑", 9)).grid(row=0, column=2, sticky=tk.W, padx=(20, 4))
+        tk.Entry(pf, textvariable=self.x_col, width=5).grid(row=0, column=3)
+        tk.Entry(pf, textvariable=self.y_col, width=5).grid(row=0, column=4)
+        tk.Label(pf, text="位置文件 skiprows", bg=COLORS["card"], font=("微软雅黑", 9)).grid(row=1, column=2, sticky=tk.W, padx=(20, 4))
+        tk.Entry(pf, textvariable=self.skiprows, width=6).grid(row=1, column=3)
+        tk.Label(pf, text="当前默认坐标：x=-colX/1e6, y=-colY/1e6", bg=COLORS["card"], fg=COLORS["label"], font=("微软雅黑", 8)).grid(row=2, column=2, columnspan=3, sticky=tk.W, padx=(20, 4))
+
+        FlatButton(c, COLORS["blue"], COLORS["blue_h"], text="生成 CXI", command=self.run_pack).pack(pady=14)
+
+    # --------------------------------------------------------------- 重建页 --
+    def setup_recon_tab(self, parent):
+        c = self.card(parent, "预设重建")
+        c.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        self.recon_cxi = tk.StringVar()
+        r = tk.Frame(c, bg=COLORS["card"])
+        r.pack(fill=tk.X, padx=12, pady=8)
+        tk.Label(r, text="CXI 文件：", bg=COLORS["card"], font=("微软雅黑", 9)).pack(side=tk.LEFT)
+        tk.Entry(r, textvariable=self.recon_cxi, font=("Consolas", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        FlatButton(r, "#95A5A6", "#7F8C8D", text="浏览", command=self.browse_recon).pack(side=tk.LEFT)
+
+        self.templates = {
+            "SSRF 单模 DM 基线":
+                '--maxsize=1890 --probe="focus,300e-6,5.075e-3" --defocus=53e-6 '
+                '--detector_distance=0.1154948 --detector_orientation 0 1 0 '
+                '--obj_smooth=0 --probe_smooth=0.2 --obj_inertia=0.05 --probe_inertia=0.02 '
+                '--algorithm="analysis,DM**1000,probe=1"',
+            "DM800 → AP100 → ML100":
+                '--maxsize=1890 --probe="focus,300e-6,5.075e-3" --defocus=53e-6 '
+                '--detector_distance=0.1154948 --detector_orientation 0 1 0 '
+                '--obj_smooth=0 --probe_smooth=0.2 --obj_inertia=0.05 --probe_inertia=0.02 '
+                '--algorithm="analysis,ML**100,AP**100,DM**800,probe=1"',
+        }
+        self.template_var = tk.StringVar(value="SSRF 单模 DM 基线")
+        cb = ttk.Combobox(c, textvariable=self.template_var, values=list(self.templates), state="readonly")
+        cb.pack(fill=tk.X, padx=12, pady=(4, 6))
+        cb.bind("<<ComboboxSelected>>", self.load_template)
+
+        tk.Label(c, text="注意：PyNX algorithm 字符串从右向左执行。", bg=COLORS["card"], fg=COLORS["orange"], font=("微软雅黑", 9, "bold")).pack(anchor=tk.W, padx=12)
+        tk.Label(c, text='例如 "ML**100,AP**100,DM**800" = DM800 → AP100 → ML100', bg=COLORS["card"], fg=COLORS["label"], font=("微软雅黑", 9)).pack(anchor=tk.W, padx=12, pady=(0, 6))
+
+        self.spell = tk.Text(c, height=10, wrap=tk.WORD, font=("Consolas", 9))
+        self.spell.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        self.load_template()
+
+        rr = tk.Frame(c, bg=COLORS["card"])
+        rr.pack(fill=tk.X, padx=12, pady=6)
+        tk.Label(rr, text="save_prefix：", bg=COLORS["card"], font=("微软雅黑", 9)).pack(side=tk.LEFT)
+        self.save_prefix = tk.StringVar(value=r"D:\pynxdatas\cpynx_result")
+        tk.Entry(rr, textvariable=self.save_prefix, font=("Consolas", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        FlatButton(rr, "#95A5A6", "#7F8C8D", text="目录", command=self.choose_save_dir).pack(side=tk.LEFT)
+
+        bf = tk.Frame(c, bg=COLORS["card"])
+        bf.pack(pady=12)
+        FlatButton(bf, COLORS["orange"], COLORS["orange_h"], text="运行重建", command=self.run_recon).pack(side=tk.LEFT, padx=5)
+        FlatButton(bf, COLORS["green"], COLORS["green_h"], text="复制命令", command=self.copy_command).pack(side=tk.LEFT, padx=5)
+
+    # ------------------------------------------------------------- 自定义页 --
+    def setup_custom_tab(self, parent):
+        c = self.card(parent, "自定义算法调度")
+        c.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        top = tk.Frame(c, bg=COLORS["card"])
+        top.pack(fill=tk.X, padx=12, pady=8)
+        tk.Label(top, text="迭代次数：", bg=COLORS["card"], font=("微软雅黑", 9)).pack(side=tk.LEFT)
+        self.iter_var = tk.StringVar(value="100")
+        tk.Entry(top, textvariable=self.iter_var, width=8, font=("Consolas", 9)).pack(side=tk.LEFT, padx=6)
+        for name in ("DM", "AP", "ML"):
+            FlatButton(top, COLORS["blue"], COLORS["blue_h"], text=name, command=lambda n=name: self.add_algo(n)).pack(side=tk.LEFT, padx=4)
+
+        tk.Label(c, text="点击后追加到 algorithm 左侧；实际执行顺序仍是从右向左。", bg=COLORS["card"], fg=COLORS["label"], font=("微软雅黑", 8)).pack(anchor=tk.W, padx=12)
+
+        self.custom_algos: List[str] = []
+        self.custom_text = tk.Text(c, height=8, wrap=tk.WORD, font=("Consolas", 9))
+        self.custom_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+
+        pf = tk.LabelFrame(c, text="常用参数", bg=COLORS["card"], font=("微软雅黑", 9, "bold"), padx=8, pady=8)
+        pf.pack(fill=tk.X, padx=12, pady=6)
+        self.custom_params = {}
+        defs = [
+            ("probe", '"focus,300e-6,5.075e-3"'),
+            ("defocus", "53e-6"),
+            ("maxsize", "1890"),
+            ("probe_smooth", "0.2"),
+            ("obj_smooth", "0"),
+            ("probe_inertia", "0.02"),
+            ("obj_inertia", "0.05"),
+        ]
+        for i, (key, val) in enumerate(defs):
+            tk.Label(pf, text=key, bg=COLORS["card"], font=("Consolas", 9)).grid(row=i // 2, column=(i % 2) * 2, sticky=tk.W, padx=4, pady=4)
+            e = tk.Entry(pf, width=26, font=("Consolas", 9))
+            e.insert(0, val)
+            e.grid(row=i // 2, column=(i % 2) * 2 + 1, sticky=tk.W, padx=4, pady=4)
+            self.custom_params[key] = e
+
+        bf = tk.Frame(c, bg=COLORS["card"])
+        bf.pack(pady=10)
+        FlatButton(bf, COLORS["blue"], COLORS["blue_h"], text="写入常用参数", command=self.write_custom_params).pack(side=tk.LEFT, padx=5)
+        FlatButton(bf, COLORS["orange"], COLORS["orange_h"], text="送到重建页", command=self.send_custom).pack(side=tk.LEFT, padx=5)
+        FlatButton(bf, "#7F8C8D", "#626F76", text="清空", command=self.clear_custom).pack(side=tk.LEFT, padx=5)
+
+    # --------------------------------------------------------------- 右侧 --
+    def setup_right(self, parent):
+        c = self.card(parent, "运行日志")
+        c.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        controls = tk.Frame(c, bg=COLORS["card"])
+        controls.pack(fill=tk.X, padx=10, pady=(4, 0))
+        self.stop_btn = FlatButton(controls, COLORS["red"], COLORS["red_h"], text="停止任务", command=self.stop_task)
+        self.stop_btn.pack(side=tk.RIGHT)
+        self.stop_btn.configure(state=tk.DISABLED)
+        FlatButton(controls, "#7F8C8D", "#626F76", text="清空日志", command=lambda: self.log_text.delete("1.0", tk.END)).pack(side=tk.RIGHT, padx=6)
+
+        self.log_text = scrolledtext.ScrolledText(c, wrap=tk.WORD, font=("Consolas", 9), bd=0)
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        r = self.card(parent, "结果工具")
+        r.pack(fill=tk.X)
+        bf = tk.Frame(r, bg=COLORS["card"])
+        bf.pack(pady=12)
+        FlatButton(bf, COLORS["purple"], COLORS["purple_h"], text="查看 CXI Object", command=self.open_visualizer).pack(side=tk.LEFT, padx=5)
+        FlatButton(bf, "#7F8C8D", "#626F76", text="打开输出目录", command=self.open_output_dir).pack(side=tk.LEFT, padx=5)
+
+    # ------------------------------------------------------------ 文件浏览 --
+    def browse_bg(self):
+        f = filedialog.askopenfilename(filetypes=[("TIFF", "*.tif *.tiff"), ("All", "*.*")])
+        if f: self.bg_var.set(f)
+
+    def browse_pty(self):
+        f = filedialog.askopenfilename(filetypes=[("TIFF", "*.tif *.tiff"), ("All", "*.*")])
+        if f: self.pty_var.set(f)
+
+    def browse_pos(self):
+        f = filedialog.askopenfilename(filetypes=[("Text", "*.txt *.dat"), ("All", "*.*")])
+        if f: self.pos_var.set(f)
+
+    def browse_out(self):
+        f = filedialog.asksaveasfilename(defaultextension=".cxi", filetypes=[("CXI", "*.cxi")])
+        if f: self.out_var.set(f)
+
+    def browse_recon(self):
+        f = filedialog.askopenfilename(filetypes=[("CXI", "*.cxi"), ("All", "*.*")])
+        if f: self.recon_cxi.set(f)
+
+    def choose_save_dir(self):
+        d = filedialog.askdirectory()
+        if d: self.save_prefix.set(str(Path(d) / "cpynx_result"))
+
+    # ------------------------------------------------------------ CXI 打包 --
+    def run_pack(self):
+        if self.state.running:
+            messagebox.showwarning("忙", "已有任务在运行。")
+            return
+        try:
+            bg, pty, pos, out = map(lambda s: Path(s.strip()), [self.bg_var.get(), self.pty_var.get(), self.pos_var.get(), self.out_var.get()])
+            for path, name in ((bg, "本底"), (pty, "衍射"), (pos, "位置")):
+                if not path.exists():
+                    raise ValueError(f"{name}文件不存在：\n{path}")
+            cfg = PackConfig(
+                pixel_size_m=float(self.pack_entries["pixel"].get()),
+                energy_ev=float(self.pack_entries["energy"].get()),
+                detector_distance_m=float(self.pack_entries["distance"].get()),
+                frames_per_position=int(self.pack_entries["nframe"].get()),
+            )
+            x_col, y_col, skiprows = int(self.x_col.get()), int(self.y_col.get()), int(self.skiprows.get())
+            if cfg.frames_per_position <= 0: raise ValueError("每位置帧数必须 > 0")
+        except Exception as e:
+            messagebox.showerror("参数错误", str(e))
+            return
+
+        self.set_running(True)
+        self.log("=" * 70)
+        self.log("开始打包 CXI")
+        self.log(f"BG   : {bg}")
+        self.log(f"PTY  : {pty}")
+        self.log(f"POS  : {pos}")
+        self.log(f"OUT  : {out}")
+
+        def worker():
+            try:
+                self.pack_cxi(bg, pty, pos, out, cfg, x_col, y_col, skiprows)
+                self.log_queue.put(("done_pack", str(out)))
+            except Exception:
+                self.log_queue.put(("line", traceback.format_exc()))
+                self.log_queue.put(("failed", "CXI 打包失败"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def pack_cxi(bg_file, pty_file, pos_file, out_file, cfg, x_col, y_col, skiprows):
+        wavelength = (1239.841984 / cfg.energy_ev) * 1e-9
+
+        bg_stack = tifffile.imread(str(bg_file)).astype(np.float32)
+        background = bg_stack.mean(axis=0) if bg_stack.ndim >= 3 else bg_stack
+
+        pty_stack = tifffile.imread(str(pty_file)).astype(np.float32)
+        if pty_stack.ndim == 2:
+            pty_stack = pty_stack[None]
+        if pty_stack.ndim != 3:
+            raise ValueError(f"衍射 TIFF 需要是 [frame,y,x]，当前 {pty_stack.shape}")
+        if pty_stack.shape[1:] != background.shape:
+            raise ValueError(f"本底和衍射尺寸不一致：{background.shape} vs {pty_stack.shape[1:]}")
+
+        pos_data = np.loadtxt(str(pos_file), skiprows=skiprows)
+        if pos_data.ndim == 1:
+            pos_data = pos_data[None]
+        if max(x_col, y_col) >= pos_data.shape[1]:
+            raise ValueError(f"位置列超界：位置文件只有 {pos_data.shape[1]} 列")
+
+        npos, nframe, npp = len(pos_data), pty_stack.shape[0], cfg.frames_per_position
+        if nframe != npos * npp:
+            raise ValueError(
+                f"帧数/位置数不匹配：frames={nframe}, positions={npos}, frames_per_position={npp}"
+            )
+
+        iobs = pty_stack - background[None]
+        np.maximum(iobs, 0, out=iobs)
+        if npp > 1:
+            iobs = iobs.reshape(npos, npp, *iobs.shape[1:]).mean(axis=1)
+
+        # 当前组内数据坐标约定
+        x_cxi = -(pos_data[:, x_col] / 1e6)
+        y_cxi = -(pos_data[:, y_col] / 1e6)
+
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        save_ptycho_data_cxi(
+            file_name=str(out_file), iobs=iobs,
+            pixel_size=cfg.pixel_size_m, wavelength=wavelength,
+            detector_distance=cfg.detector_distance_m,
+            x=x_cxi, y=y_cxi,
+        )
+
+    # -------------------------------------------------------------- 重建 --
+    def load_template(self, _=None):
+        text = self.templates.get(self.template_var.get(), "")
+        self.spell.delete("1.0", tk.END)
+        self.spell.insert("1.0", text)
+
+    def build_command(self) -> List[str]:
+        cxi = Path(self.recon_cxi.get().strip())
+        if not cxi.exists():
+            raise ValueError(f"请选择有效 CXI：\n{cxi}")
+        if not PYNX_CMD.exists():
+            raise ValueError(f"未找到 PyNX CLI：\n{PYNX_CMD}")
+
+        spell = self.spell.get("1.0", tk.END).strip()
+        if not spell:
+            raise ValueError("重建参数为空")
+
+        args = shlex.split(spell, posix=False)
+        args = [a[1:-1] if len(a) >= 2 and a[0] == a[-1] == '"' else a for a in args]
+        if not any(a.startswith("--cxifile") or a.startswith("--data") for a in args):
+            args.insert(0, f"--cxifile={cxi}")
+
+        prefix = self.save_prefix.get().strip()
+        if prefix and not any(a.startswith("--save_prefix") for a in args):
+            args.append(f"--save_prefix={prefix}")
+        if "--saveplot" not in args:
+            args.append("--saveplot")
+
+        self.state.last_cxi = cxi
+        self.state.last_save_prefix = Path(prefix) if prefix else None
+        return [str(PYNX_CMD), *args]
+
+    def run_recon(self):
+        try:
+            cmd = self.build_command()
+        except Exception as e:
+            messagebox.showerror("无法运行", str(e))
+            return
+        self.start_process(cmd)
+
+    def copy_command(self):
+        try:
+            cmd = self.build_command()
+        except Exception as e:
+            messagebox.showerror("无法生成", str(e))
+            return
+        text = subprocess.list2cmdline(cmd)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        messagebox.showinfo("已复制", "完整命令已复制。")
+
+    # ---------------------------------------------------------- 自定义算法 --
+    def add_algo(self, name):
+        try:
+            n = int(self.iter_var.get())
+            if n <= 0: raise ValueError
+        except ValueError:
+            messagebox.showerror("错误", "迭代次数必须是正整数")
+            return
+        self.custom_algos.insert(0, f"{name}**{n}")
+        self.refresh_custom()
+
+    def refresh_custom(self):
+        txt = self.custom_text.get("1.0", tk.END).strip()
+        import re
+        rest = re.sub(r'--algorithm="[^"]*"\s*', '', txt).strip()
+        alg = f'--algorithm="{",".join(self.custom_algos)}"' if self.custom_algos else ''
+        out = (alg + " " + rest).strip()
+        self.custom_text.delete("1.0", tk.END)
+        self.custom_text.insert("1.0", out)
+
+    def write_custom_params(self):
+        txt = self.custom_text.get("1.0", tk.END).strip()
+        extras = []
+        for key, entry in self.custom_params.items():
+            val = entry.get().strip()
+            if val:
+                extras.append(f"--{key}={val}")
+        import re
+        for key in self.custom_params:
+            txt = re.sub(rf'--{re.escape(key)}=("[^"]*"|\S+)\s*', '', txt).strip()
+        txt = (txt + " " + " ".join(extras)).strip()
+        self.custom_text.delete("1.0", tk.END)
+        self.custom_text.insert("1.0", txt)
+
+    def send_custom(self):
+        txt = self.custom_text.get("1.0", tk.END).strip()
+        if not txt: return
+        self.spell.delete("1.0", tk.END)
+        self.spell.insert("1.0", txt)
+        messagebox.showinfo("已发送", "已写入预设重建页。")
+
+    def clear_custom(self):
+        self.custom_algos.clear()
+        self.custom_text.delete("1.0", tk.END)
+
+    # ------------------------------------------------------- 子进程与日志 --
+    def start_process(self, cmd: List[str]):
+        if self.state.running:
+            messagebox.showwarning("忙", "已有任务在运行。")
+            return
+        self.set_running(True)
+        self.log_text.delete("1.0", tk.END)
+        self.log("=" * 70)
+        self.log("PyNX reconstruction")
+        self.log(subprocess.list2cmdline(cmd))
+        self.log("=" * 70)
+
+        def worker():
+            try:
+                flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                self.process = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", bufsize=1,
+                    creationflags=flags
+                )
+                assert self.process.stdout is not None
+                for line in self.process.stdout:
+                    self.log_queue.put(("line", line.rstrip("\n")))
+                rc = self.process.wait()
+                self.process = None
+                self.log_queue.put(("done" if rc == 0 else "failed", f"任务结束，return code={rc}"))
+            except Exception:
+                self.log_queue.put(("line", traceback.format_exc()))
+                self.log_queue.put(("failed", "任务启动失败"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def drain_log_queue(self):
+        try:
+            while True:
+                kind, text = self.log_queue.get_nowait()
+                if kind == "line":
+                    self.log(text)
+                elif kind == "done_pack":
+                    self.log(f"CXI 文件生成成功：{text}")
+                    self.set_running(False)
+                    self.state.last_cxi = Path(text)
+                    if messagebox.askyesno("完成", "是否把该 CXI 送到重建页？"):
+                        self.recon_cxi.set(text)
+                elif kind == "done":
+                    self.log(text)
+                    self.set_running(False)
+                elif kind == "failed":
+                    self.log(text)
+                    self.set_running(False)
+        except queue.Empty:
+            pass
+        self.root.after(80, self.drain_log_queue)
+
+    def stop_task(self):
+        if not self.process or self.process.poll() is not None:
+            return
+        if messagebox.askyesno("停止", "确定终止当前任务？"):
+            self.process.terminate()
+            self.log("已发送 terminate")
+
+    def set_running(self, running):
+        self.state.running = running
+        self.stop_btn.configure(state=tk.NORMAL if running else tk.DISABLED)
+        self.status.set("运行中..." if running else "就绪")
+
+    def log(self, text):
+        self.log_text.insert(tk.END, str(text) + "\n")
+        self.log_text.see(tk.END)
+
+    # ------------------------------------------------------------- 结果查看 --
+    def open_visualizer(self):
+        f = filedialog.askopenfilename(filetypes=[("CXI/HDF5", "*.cxi *.h5 *.hdf5"), ("All", "*.*")])
+        if not f: return
+        try:
+            import h5py
+            import matplotlib.pyplot as plt
+            with h5py.File(f, "r") as h:
+                candidates = ["/entry_1/result_1/Object-layer00", "/entry_1/result_1/object"]
+                path = next((p for p in candidates if p in h), None)
+                if path is None:
+                    raise KeyError("没有找到常见 Object 数据集")
+                obj = np.asarray(h[path][()]).squeeze()
+            if obj.ndim != 2:
+                raise ValueError(f"Object shape={obj.shape}，不是二维")
+            fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+            ax[0].imshow(np.angle(obj), cmap="gray"); ax[0].set_title("Object phase"); ax[0].axis("off")
+            ax[1].imshow(np.abs(obj), cmap="gray"); ax[1].set_title("Object amplitude"); ax[1].axis("off")
+            plt.tight_layout(); plt.show()
+        except Exception as e:
+            messagebox.showerror("查看失败", f"{type(e).__name__}: {e}")
+
+    def open_output_dir(self):
+        p = Path(self.save_prefix.get().strip()).parent if self.save_prefix.get().strip() else SCRIPT_DIR
+        if not p.exists():
+            messagebox.showerror("目录不存在", str(p)); return
+        if os.name == "nt": os.startfile(str(p))
+        else: subprocess.Popen(["xdg-open", str(p)])
+
+    def on_close(self):
+        if self.state.running and not messagebox.askyesno("退出", "当前仍有任务运行，确定退出？"):
+            return
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    CPyNXApp(root)
+    root.mainloop()
